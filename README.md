@@ -1,6 +1,6 @@
 # codespace-canvas
 
-A [GitHub Copilot CLI](https://github.com/github/copilot-cli) **canvas extension** that embeds a GitHub Codespace directly in a Copilot side panel.
+A **canvas extension** for the [GitHub Copilot app](https://github.com/features/copilot) that embeds a GitHub Codespace directly in a Copilot side panel.
 
 Open a picker of all your codespaces, or jump straight into a specific one — without leaving the Copilot app.
 
@@ -84,7 +84,7 @@ The port previews rely on the Codespaces port-forwarding service. The app must b
 
 ## Prerequisites
 
-- GitHub Copilot CLI / GitHub app with canvas-extension support.
+- The GitHub Copilot app with canvas-extension support.
 - The [`gh` CLI](https://cli.github.com/) installed and authenticated.
 - For **listing codespaces** and the **auth-free port previews** (`publicPort` /
   `remotePort`), the `gh` token needs the `codespace` scope:
