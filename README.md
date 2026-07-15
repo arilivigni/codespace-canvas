@@ -8,13 +8,32 @@ Open a picker of all your codespaces, or jump straight into a specific one — w
 
 - **Picker mode** — lists your codespaces (name, repository, branch, state, last used) with an **Open** button for each, plus **New codespace** and **Refresh**.
 - **Direct mode** — open a specific codespace editor by name (one-time github.com sign-in in the webview, then it persists), or load an explicit URL.
-- **Public port (auth-free)** — set `publicPort` to flip a codespace port to **public** visibility and load its real GitHub browse URL. Shareable and requires no sign-in. ⚠️ Anyone with the URL can reach it.
+- **Public port (auth-free)** — set `publicPort` to expose a codespace port with **public** visibility and load its real GitHub browse URL. Shareable and requires no sign-in. ⚠️ Anyone with the URL can reach it.
 - **Private forward (auth-free)** — set `remotePort` to forward a codespace port to loopback (`127.0.0.1`) over the app's `gh` login. No sign-in, private to your machine.
+- **Start the app for you (`startCommand`)** — combined with `publicPort`/`remotePort`, runs a command inside the codespace over `gh` to launch the app first, then previews it. **No web editor at all** — requires the devcontainer `sshd` feature (see below).
 - **Agent actions** — the Copilot agent can call:
   - `list_codespaces` — returns your codespaces as JSON (optionally filtered by repo).
   - `get_current` — reports what the panel is currently showing (mode, url, ports, browseUrl).
+  - `exec_in_codespace` — run any shell command inside a codespace over `gh` (auth-free); `background: true` to start a long-running server. Requires the `sshd` feature.
   - `make_port_private` — revert a `publicPort` exposure back to private.
   - `stop_forward` — stop a private `remotePort` forward for the instance.
+
+## Running commands / starting the app (`sshd` feature)
+
+`startCommand` and `exec_in_codespace` run commands via `gh codespace ssh`, which
+needs an **SSH server in the container**. Add the feature to your repo's
+`.devcontainer/devcontainer.json` and rebuild (or create) the codespace:
+
+```jsonc
+"features": {
+  "ghcr.io/devcontainers/features/sshd:1": { "version": "latest" }
+}
+```
+
+With that in place, the whole preview flow is **fully auth-free** — the extension
+starts your app and exposes the port using only the app's `gh` login, and you
+never open the web editor or hit a 2FA prompt. Without `sshd`, use `publicPort`/
+`remotePort` on a port you started yourself (e.g. from the editor terminal).
 
 ## Auth model
 
@@ -45,16 +64,22 @@ auth and redirects to the correct editor host.
 
 **Port previews** don't need the editor's cookie at all:
 
-- `publicPort` runs `gh codespace ports visibility <port>:public`, then reads
-  the real `browseUrl` from `gh codespace ports --json` (never guessed) and
-  loads it. Public ports serve without any auth.
-- `remotePort` runs `gh codespace ports forward <local>:<remote>` to an
+- `remotePort` runs `gh codespace ports forward <remote>:<local>` to an
   ephemeral loopback port and loads `http://127.0.0.1:<local>` — private to
   your machine, no auth.
+- `publicPort` first forwards the port (headless, a listening port isn't
+  auto-detected the way the web editor does it), which registers it and lets the
+  extension probe the app for readiness, then runs
+  `gh codespace ports visibility <port>:public` and loads the real `browseUrl`
+  from `gh codespace ports --json` (never guessed). Public ports serve without
+  any auth.
+- `startCommand` (optional) runs `gh codespace ssh -c <name> -- <command>`
+  detached to launch the app before either preview. This needs the `sshd`
+  feature; the port previews themselves do not.
 
-Both rely only on the Codespaces port-forwarding service (no in-container
-`sshd` required). The app must already be **listening** on the port inside the
-codespace.
+The port previews rely on the Codespaces port-forwarding service. The app must be
+**listening** on the port inside the codespace — either started by you, or by
+`startCommand`.
 
 ## Prerequisites
 
@@ -95,6 +120,7 @@ Once installed, ask Copilot to open the canvas, e.g.:
 - "Open codespace `octocat-myrepo-abc123`" → opens that codespace editor directly.
 - "Preview port 3000 of my codespace publicly" → `publicPort` (auth-free, shareable).
 - "Forward port 3000 of my codespace privately" → `remotePort` (auth-free, local only).
+- "Run my dev server and preview it" → `startCommand` + `publicPort`/`remotePort` (auth-free, no editor; needs `sshd`).
 
 The canvas id is `codespace-canvas`. Open input:
 
@@ -103,13 +129,14 @@ The canvas id is `codespace-canvas`. Open input:
   "codespaceName": "octocat-myrepo-abc123", // open this codespace editor directly
   "repo": "owner/repo",                     // filter picker + target "New codespace"
   "url": "https://...",                     // load an explicit URL
-  "publicPort": 3000,                       // set port public + load its GitHub URL (auth-free, shareable)
-  "remotePort": 3000                        // forward port to 127.0.0.1 (auth-free, private)
+  "publicPort": 3000,                       // expose port publicly + load its GitHub URL (auth-free, shareable)
+  "remotePort": 3000,                       // forward port to 127.0.0.1 (auth-free, private)
+  "startCommand": "npm run dev"             // start the app in the codespace first (needs sshd)
 }
 ```
 
-`publicPort` and `remotePort` require `codespaceName` and an app already
-listening on that port inside the codespace.
+`publicPort` and `remotePort` require `codespaceName` and an app listening on
+that port — either started by you or by `startCommand`.
 
 ## Development
 

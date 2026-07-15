@@ -91,6 +91,47 @@ async function listCodespaces(repo) {
     return { ok: true, codespaces: data };
 }
 
+// Single-quote a string for a POSIX shell.
+function shQuote(s) {
+    return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+
+// Run a command inside a codespace over the app's `gh` login — auth-free, no
+// web editor. Requires an SSH server in the container (devcontainer `sshd`
+// feature). With background:true the command is detached (nohup + disown) so a
+// dev server keeps running after the ssh session closes.
+function runInCodespace(codespaceName, command, { background = false, timeoutMs = 90000 } = {}) {
+    const remote = background
+        ? `nohup bash -lc ${shQuote(command)} >/tmp/codespace-canvas.log 2>&1 & disown; echo started`
+        : command;
+    return new Promise((resolve) => {
+        execFile(
+            "gh",
+            ["codespace", "ssh", "-c", codespaceName, "--", remote],
+            { maxBuffer: 10 * 1024 * 1024, env: ghEnv(), timeout: timeoutMs },
+            (error, stdout, stderr) => {
+                const err = (stderr || "").toString();
+                const noSshd =
+                    /SSH server is installed in the container|failed to start SSH server/i.test(
+                        err,
+                    );
+                resolve({
+                    ok: !error,
+                    noSshd,
+                    stdout: (stdout || "").toString(),
+                    stderr: err,
+                });
+            },
+        );
+    });
+}
+
+const NO_SSHD_MESSAGE =
+    "This codespace has no SSH server, so commands can't be run over gh. Add " +
+    '`ghcr.io/devcontainers/features/sshd:1` to the repo\'s ' +
+    ".devcontainer/devcontainer.json `features`, rebuild the codespace, then " +
+    "retry. (Or start the app manually via the editor.)";
+
 // ---------------------------------------------------------------------------
 // URL builders
 // ---------------------------------------------------------------------------
@@ -151,6 +192,7 @@ function probeHttp(port) {
 }
 
 // Spawn a long-lived `gh codespace ports forward` process. Returns the child.
+// gh's argument order is <remote-port>:<local-port> (remote = codespace port).
 function startForward(codespaceName, remotePort, localPort) {
     return spawn(
         "gh",
@@ -158,7 +200,7 @@ function startForward(codespaceName, remotePort, localPort) {
             "codespace",
             "ports",
             "forward",
-            `${localPort}:${remotePort}`,
+            `${remotePort}:${localPort}`,
             "-c",
             codespaceName,
         ],
@@ -245,12 +287,51 @@ async function browseUrlFor(codespaceName, port) {
     }
 }
 
-// PUBLIC, auth-free: mark a codespace port public and load its GitHub URL.
+// PUBLIC, auth-free: expose a codespace port and load its GitHub URL.
+//
+// Headless (no web editor), a listening port is NOT auto-forwarded, so we must
+// register it ourselves by forwarding <port>:<localPort> — that both registers
+// the port with the tunnel service and lets us probe the app for readiness.
+// Once the port is public the tunnel serves it independently, but we keep the
+// forward process alive for the instance (cleaned up on close / mode switch).
 async function openPublicPort(instanceId, codespaceName, publicPort, repo) {
     if (!Number.isInteger(publicPort)) {
         throw new Error("publicPort must be an integer");
     }
     await cleanupTunnel(instanceId);
+
+    const localPort = await getFreePort();
+    log(`Exposing ${codespaceName}:${publicPort}…`, { ephemeral: true });
+    const forwardProc = startForward(codespaceName, publicPort, localPort);
+    let forwardExited = false;
+    forwardProc.on("exit", () => {
+        forwardExited = true;
+    });
+
+    // Wait for the forward to register AND the app to respond.
+    const deadline = Date.now() + 25000;
+    let ready = false;
+    while (Date.now() < deadline) {
+        if (forwardExited) break;
+        if (await probeHttp(localPort)) {
+            ready = true;
+            break;
+        }
+        await new Promise((r) => setTimeout(r, 750));
+    }
+    if (!ready) {
+        try {
+            forwardProc.kill();
+        } catch {}
+        if (forwardExited) {
+            throw new Error(
+                "`gh codespace ports forward` exited immediately. Make sure the token gh uses has the `codespace` scope (`gh auth refresh -h github.com -s codespace`) and that the codespace is running.",
+            );
+        }
+        throw new Error(
+            `Timed out preparing port ${publicPort}. Is an app listening on that port in the codespace?`,
+        );
+    }
 
     log(`Making ${codespaceName}:${publicPort} public…`, { ephemeral: true });
     const vis = await gh([
@@ -262,17 +343,25 @@ async function openPublicPort(instanceId, codespaceName, publicPort, repo) {
         codespaceName,
     ]);
     if (!vis.ok) {
-        const notForwarded = /not forwarded|no port|not found/i.test(vis.stderr);
+        try {
+            forwardProc.kill();
+        } catch {}
         throw new Error(
-            notForwarded
-                ? `Port ${publicPort} isn't forwarded yet. Start the app in the codespace (so the port is detected), then retry. gh said: ${vis.stderr.trim()}`
-                : `Could not make port ${publicPort} public. Your org may forbid public ports. gh said: ${vis.stderr.trim()}`,
+            `Could not make port ${publicPort} public. Your org may forbid public ports. gh said: ${vis.stderr.trim()}`,
         );
     }
 
-    const info = await browseUrlFor(codespaceName, publicPort);
+    // Read the real browse URL (may lag a moment behind the visibility change).
+    let info = await browseUrlFor(codespaceName, publicPort);
+    if (!info?.browseUrl) {
+        await new Promise((r) => setTimeout(r, 1500));
+        info = await browseUrlFor(codespaceName, publicPort);
+    }
     const url = info?.browseUrl;
     if (!url) {
+        try {
+            forwardProc.kill();
+        } catch {}
         throw new Error(
             `Port ${publicPort} was set public but gh returned no browse URL for it yet. Retry in a moment.`,
         );
@@ -286,7 +375,9 @@ async function openPublicPort(instanceId, codespaceName, publicPort, repo) {
         repo: repo || "",
         codespaceName,
         remotePort: publicPort,
+        localPort,
         browseUrl: url,
+        forwardProc,
     });
     return { url, title, status: `Port ${publicPort} · PUBLIC` };
 }
@@ -478,7 +569,7 @@ const session = await joinSession({
             id: CANVAS_ID,
             displayName: "GitHub Codespace",
             description:
-                "Open a GitHub Codespace in a side panel. Show a picker, open a codespace's hosted editor (browser), or preview an app running inside a codespace auth-free via the app's gh login: publicPort sets a port public and loads its GitHub URL (shareable), or remotePort forwards a port to loopback (private to this machine).",
+                "Open a GitHub Codespace in a side panel. Show a picker, open a codespace's hosted editor (browser), or preview an app running inside a codespace auth-free via the app's gh login: publicPort sets a port public and loads its GitHub URL (shareable), or remotePort forwards a port to loopback (private to this machine). With startCommand (needs the devcontainer sshd feature) it can also start the app for you first — no editor sign-in.",
             inputSchema: {
                 type: "object",
                 properties: {
@@ -506,6 +597,11 @@ const session = await joinSession({
                         type: "integer",
                         description:
                             "Requires codespaceName. Forward this codespace port to loopback and load http://127.0.0.1 — auth-free and PRIVATE to this machine. The app must already be listening on the port.",
+                    },
+                    startCommand: {
+                        type: "string",
+                        description:
+                            "Requires codespaceName and publicPort or remotePort. Command to start the app inside the codespace over the app's gh login (auth-free, no editor) before previewing — e.g. 'python3 -m http.server 8000'. Runs detached. Requires the devcontainer `sshd` feature.",
                     },
                 },
             },
@@ -545,6 +641,55 @@ const session = await joinSession({
                             localPort: state.localPort ?? null,
                             remotePort: state.remotePort ?? null,
                             browseUrl: state.browseUrl ?? null,
+                        };
+                    },
+                },
+                {
+                    name: "exec_in_codespace",
+                    description:
+                        "Run a shell command inside a codespace over the app's gh login (auth-free, no web editor). Requires the devcontainer `sshd` feature. Set background:true to start a long-running server that keeps running after the command returns.",
+                    inputSchema: {
+                        type: "object",
+                        properties: {
+                            codespaceName: {
+                                type: "string",
+                                description:
+                                    "Codespace name. Defaults to the one this canvas is showing.",
+                            },
+                            command: {
+                                type: "string",
+                                description:
+                                    "Shell command to run inside the codespace.",
+                            },
+                            background: {
+                                type: "boolean",
+                                description:
+                                    "Run detached (nohup) so a dev server keeps running. Default false.",
+                            },
+                        },
+                        required: ["command"],
+                    },
+                    handler: async (ctx) => {
+                        const state = instances.get(ctx.instanceId);
+                        const codespaceName =
+                            ctx.input?.codespaceName || state?.codespaceName;
+                        const command = ctx.input?.command;
+                        if (!codespaceName || !command) {
+                            return {
+                                ok: false,
+                                error: "codespaceName and command are required",
+                            };
+                        }
+                        const res = await runInCodespace(codespaceName, command, {
+                            background: ctx.input?.background === true,
+                        });
+                        if (!res.ok && res.noSshd) {
+                            return { ok: false, error: NO_SSHD_MESSAGE };
+                        }
+                        return {
+                            ok: res.ok,
+                            stdout: res.stdout.trim(),
+                            stderr: res.stderr.trim(),
                         };
                     },
                 },
@@ -610,12 +755,38 @@ const session = await joinSession({
                     input.publicPort != null && input.publicPort !== "";
                 const hasRemotePort =
                     input.remotePort != null && input.remotePort !== "";
+                const startCommand =
+                    typeof input.startCommand === "string" ? input.startCommand.trim() : "";
 
                 const existing = instances.get(ctx.instanceId);
 
                 // Auth-free app preview (via the app's gh login).
                 if (codespaceName && (hasPublicPort || hasRemotePort)) {
                     if (existing?.server) await closeServer(ctx.instanceId);
+
+                    // Optionally start the app in the codespace first (no editor).
+                    if (startCommand) {
+                        log(
+                            `Starting in ${codespaceName}: ${startCommand}`,
+                            { ephemeral: true },
+                        );
+                        const run = await runInCodespace(codespaceName, startCommand, {
+                            background: true,
+                        });
+                        if (!run.ok && run.noSshd) {
+                            throw new Error(NO_SSHD_MESSAGE);
+                        }
+                        if (!run.ok) {
+                            throw new Error(
+                                `Failed to start the app in ${codespaceName}: ${
+                                    run.stderr.trim() || "gh codespace ssh failed"
+                                }`,
+                            );
+                        }
+                        // Give the server a moment to bind before we forward/probe.
+                        await new Promise((r) => setTimeout(r, 2000));
+                    }
+
                     if (hasPublicPort) {
                         return await openPublicPort(
                             ctx.instanceId,
