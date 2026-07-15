@@ -8,6 +8,7 @@ Open a picker of all your codespaces, or jump straight into a specific one — w
 
 - **Picker mode** — lists your codespaces (name, repository, branch, state, last used) with an **Open** button for each, plus **New codespace** and **Refresh**.
 - **Direct mode** — open a specific codespace editor by name (one-time github.com sign-in in the webview, then it persists), or load an explicit URL.
+- **Sign-in-free editor (`editorServe`)** — set `editorServe: true` to get a **full VS Code editor with no github.com sign-in at all**. The extension runs `code serve-web` inside the codespace (authenticated by a per-open connection token in the URL, not a github.com cookie), exposes its port, and loads the tokenized URL. Requires the devcontainer `sshd` feature (see below).
 - **Public port (auth-free)** — set `publicPort` to expose a codespace port with **public** visibility and load its real GitHub browse URL. Shareable and requires no sign-in. ⚠️ Anyone with the URL can reach it.
 - **Private forward (auth-free)** — set `remotePort` to forward a codespace port to loopback (`127.0.0.1`) over the app's `gh` login. No sign-in, private to your machine.
 - **Start the app for you (`startCommand`)** — combined with `publicPort`/`remotePort`, runs a command inside the codespace over `gh` to launch the app first, then previews it. **No web editor at all** — requires the devcontainer `sshd` feature (see below).
@@ -42,7 +43,7 @@ There are two separate auth surfaces:
 - **`gh` API calls** (listing codespaces, forwarding ports, changing visibility) use your `gh` CLI login. The `publicPort` and `remotePort` features run entirely over this, so **the app authenticates them for you — no sign-in appears in the webview.**
 - **The hosted editor** (direct mode) is a github.com web app that needs a browser session cookie. That cookie can't be minted from an OAuth token, so the **editor asks you to sign in once** in the webview; it persists afterward.
 
-If you want to preview an app running inside a codespace with **zero webview login**, use `publicPort` (shareable) or `remotePort` (private) instead of the editor.
+If you want a **full editor with zero github.com sign-in**, use `editorServe: true` — it runs `code serve-web` inside the codespace and authenticates with a connection token in the URL instead of a github.com cookie. If you just want to preview a running app with **zero webview login**, use `publicPort` (shareable) or `remotePort` (private) instead of the editor.
 
 ## How it works
 

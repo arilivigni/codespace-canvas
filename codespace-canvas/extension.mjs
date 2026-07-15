@@ -15,16 +15,21 @@
 
 import { createServer, get as httpGet } from "node:http";
 import { execFile, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import net from "node:net";
 import { joinSession, createCanvas } from "@github/copilot-sdk/extension";
 
 const CANVAS_ID = "codespace-canvas";
 
+// Codespace-side port used to host the self-served VS Code editor (editorServe).
+const CS_EDITOR_PORT = 8200;
+
 // Per-instance state. Shapes by mode:
 //   picker:  { server, url, title, mode, repo }
 //   direct:  { url, title, mode, repo }
 //   forward: { url, title, mode, repo, codespaceName, remotePort, localPort, forwardProc }
-//   public:  { url, title, mode, repo, codespaceName, remotePort, browseUrl }
+//   public:  { url, title, mode, repo, codespaceName, remotePort, localPort, browseUrl, forwardProc }
+//   editor:  { url, title, mode, repo, codespaceName, remotePort, localPort, browseUrl, forwardProc }
 const instances = new Map();
 
 let sessionRef = null;
@@ -382,6 +387,134 @@ async function openPublicPort(instanceId, codespaceName, publicPort, repo) {
     return { url, title, status: `Port ${publicPort} · PUBLIC` };
 }
 
+// Remote script that ensures the standalone VS Code CLI is present, then execs
+// `code serve-web` bound to loopback with a connection token. Run via
+// runInCodespace(background:true) so the whole thing is nohup-detached and the
+// exec'd server survives the ssh session. The editor's auth is that token (in
+// the URL) — NOT a github.com login — so it opens sign-in free. serve-web
+// downloads its web assets on first connection, so the first load can take a
+// little longer.
+function serveWebScript(port, token) {
+    return [
+        "mkdir -p /tmp/vscode-cli && cd /tmp/vscode-cli",
+        "if [ ! -x ./code ]; then " +
+            'curl -sLk "https://code.visualstudio.com/sha/download?build=stable&os=cli-alpine-x64" -o cli.tgz && ' +
+            "tar -xzf cli.tgz; fi",
+        `exec ./code serve-web --port ${port} --host 127.0.0.1 ` +
+            `--connection-token ${token} --accept-server-license-terms ` +
+            "--server-data-dir /tmp/serve-web-data",
+    ].join("\n");
+}
+
+// Sign-in-free editor: run `code serve-web` inside the codespace (auth = a
+// connection token, no github.com login), then expose its port publicly and
+// load the tokenized URL. Requires the devcontainer `sshd` feature.
+async function openEditorServe(instanceId, codespaceName, repo) {
+    await cleanupTunnel(instanceId);
+
+    const token = randomUUID().replace(/-/g, "");
+    log(`Starting sign-in-free editor in ${codespaceName}…`, { ephemeral: true });
+
+    // Stop any editor server we started before (fresh token each open).
+    const kill = await runInCodespace(
+        codespaceName,
+        `pkill -f "serve-web --port ${CS_EDITOR_PORT}" 2>/dev/null; sleep 1; true`,
+        { background: false, timeoutMs: 60000 },
+    );
+    if (!kill.ok && kill.noSshd) throw new Error(NO_SSHD_MESSAGE);
+
+    // Launch serve-web detached (downloads the CLI on first use).
+    const run = await runInCodespace(
+        codespaceName,
+        serveWebScript(CS_EDITOR_PORT, token),
+        { background: true, timeoutMs: 60000 },
+    );
+    if (!run.ok && run.noSshd) throw new Error(NO_SSHD_MESSAGE);
+    if (!run.ok) {
+        throw new Error(
+            `Could not start the editor server in ${codespaceName}: ${
+                run.stderr.trim() || "gh codespace ssh failed"
+            }`,
+        );
+    }
+
+    const localPort = await getFreePort();
+    const forwardProc = startForward(codespaceName, CS_EDITOR_PORT, localPort);
+    let forwardExited = false;
+    forwardProc.on("exit", () => {
+        forwardExited = true;
+    });
+
+    // serve-web downloads assets on first hit — allow generous readiness time.
+    const deadline = Date.now() + 90000;
+    let ready = false;
+    while (Date.now() < deadline) {
+        if (forwardExited) break;
+        if (await probeHttp(localPort)) {
+            ready = true;
+            break;
+        }
+        await new Promise((r) => setTimeout(r, 1000));
+    }
+    if (!ready) {
+        try {
+            forwardProc.kill();
+        } catch {}
+        throw new Error(
+            forwardExited
+                ? "`gh codespace ports forward` exited immediately. Ensure gh has the `codespace` scope and the codespace is running."
+                : "Timed out waiting for the editor server to come up. Check /tmp/codespace-canvas.log in the codespace.",
+        );
+    }
+
+    log("Publishing editor port…", { ephemeral: true });
+    const vis = await gh([
+        "codespace",
+        "ports",
+        "visibility",
+        `${CS_EDITOR_PORT}:public`,
+        "-c",
+        codespaceName,
+    ]);
+    if (!vis.ok) {
+        try {
+            forwardProc.kill();
+        } catch {}
+        throw new Error(
+            `Could not expose the editor port. Your org may forbid public ports. gh said: ${vis.stderr.trim()}`,
+        );
+    }
+
+    let info = await browseUrlFor(codespaceName, CS_EDITOR_PORT);
+    if (!info?.browseUrl) {
+        await new Promise((r) => setTimeout(r, 1500));
+        info = await browseUrlFor(codespaceName, CS_EDITOR_PORT);
+    }
+    if (!info?.browseUrl) {
+        try {
+            forwardProc.kill();
+        } catch {}
+        throw new Error(
+            "Editor port was exposed but gh returned no browse URL yet. Retry in a moment.",
+        );
+    }
+
+    const url = `${info.browseUrl}/?tkn=${token}`;
+    const title = `${codespaceName} · editor`;
+    instances.set(instanceId, {
+        url,
+        title,
+        mode: "editor",
+        repo: repo || "",
+        codespaceName,
+        remotePort: CS_EDITOR_PORT,
+        localPort,
+        browseUrl: info.browseUrl,
+        forwardProc,
+    });
+    return { url, title, status: "Editor (sign-in free)" };
+}
+
 async function cleanupTunnel(instanceId) {
     const state = instances.get(instanceId);
     if (!state) return;
@@ -569,7 +702,7 @@ const session = await joinSession({
             id: CANVAS_ID,
             displayName: "GitHub Codespace",
             description:
-                "Open a GitHub Codespace in a side panel. Show a picker, open a codespace's hosted editor (browser), or preview an app running inside a codespace auth-free via the app's gh login: publicPort sets a port public and loads its GitHub URL (shareable), or remotePort forwards a port to loopback (private to this machine). With startCommand (needs the devcontainer sshd feature) it can also start the app for you first — no editor sign-in.",
+                "Open a GitHub Codespace in a side panel. Show a picker, open a codespace's hosted editor (browser), or preview an app running inside a codespace auth-free via the app's gh login: publicPort sets a port public and loads its GitHub URL (shareable), or remotePort forwards a port to loopback (private to this machine). With startCommand (needs the devcontainer sshd feature) it can also start the app for you first — no editor sign-in. With editorServe (needs sshd) it opens a full VS Code editor with NO github.com sign-in via a token-authed code serve-web.",
             inputSchema: {
                 type: "object",
                 properties: {
@@ -602,6 +735,11 @@ const session = await joinSession({
                         type: "string",
                         description:
                             "Requires codespaceName and publicPort or remotePort. Command to start the app inside the codespace over the app's gh login (auth-free, no editor) before previewing — e.g. 'python3 -m http.server 8000'. Runs detached. Requires the devcontainer `sshd` feature.",
+                    },
+                    editorServe: {
+                        type: "boolean",
+                        description:
+                            "Requires codespaceName. Open a full VS Code editor with NO github.com sign-in: runs `code serve-web` inside the codespace (auth is a connection token in the URL) and exposes it. Requires the devcontainer `sshd` feature.",
                     },
                 },
             },
@@ -734,11 +872,11 @@ const session = await joinSession({
                 {
                     name: "stop_forward",
                     description:
-                        "Stop the private port-forward for this canvas instance (kills the gh forward process). No-op if not forwarding.",
+                        "Stop the port-forward for this canvas instance (kills the gh forward process). Applies to forward, public, and editor modes. No-op otherwise.",
                     handler: async (ctx) => {
                         const state = instances.get(ctx.instanceId);
-                        if (!state || state.mode !== "forward") {
-                            return { stopped: false, reason: "not forwarding" };
+                        if (!state || !state.forwardProc) {
+                            return { stopped: false, reason: "no active forward" };
                         }
                         await cleanupTunnel(ctx.instanceId);
                         return { stopped: true, codespaceName: state.codespaceName };
@@ -757,8 +895,15 @@ const session = await joinSession({
                     input.remotePort != null && input.remotePort !== "";
                 const startCommand =
                     typeof input.startCommand === "string" ? input.startCommand.trim() : "";
+                const editorServe = input.editorServe === true;
 
                 const existing = instances.get(ctx.instanceId);
+
+                // Sign-in-free editor (code serve-web over the app's gh login).
+                if (codespaceName && editorServe) {
+                    if (existing?.server) await closeServer(ctx.instanceId);
+                    return await openEditorServe(ctx.instanceId, codespaceName, repo);
+                }
 
                 // Auth-free app preview (via the app's gh login).
                 if (codespaceName && (hasPublicPort || hasRemotePort)) {
