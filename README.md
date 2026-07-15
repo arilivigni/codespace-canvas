@@ -7,10 +7,23 @@ Open a picker of all your codespaces, or jump straight into a specific one — w
 ## Features
 
 - **Picker mode** — lists your codespaces (name, repository, branch, state, last used) with an **Open** button for each, plus **New codespace** and **Refresh**.
-- **Direct mode** — open a specific codespace by name, or load an explicit URL (e.g. a forwarded port).
+- **Direct mode** — open a specific codespace editor by name (one-time github.com sign-in in the webview, then it persists), or load an explicit URL.
+- **Public port (auth-free)** — set `publicPort` to flip a codespace port to **public** visibility and load its real GitHub browse URL. Shareable and requires no sign-in. ⚠️ Anyone with the URL can reach it.
+- **Private forward (auth-free)** — set `remotePort` to forward a codespace port to loopback (`127.0.0.1`) over the app's `gh` login. No sign-in, private to your machine.
 - **Agent actions** — the Copilot agent can call:
   - `list_codespaces` — returns your codespaces as JSON (optionally filtered by repo).
-  - `get_current` — reports what the panel is currently showing.
+  - `get_current` — reports what the panel is currently showing (mode, url, ports, browseUrl).
+  - `make_port_private` — revert a `publicPort` exposure back to private.
+  - `stop_forward` — stop a private `remotePort` forward for the instance.
+
+## Auth model
+
+There are two separate auth surfaces:
+
+- **`gh` API calls** (listing codespaces, forwarding ports, changing visibility) use your `gh` CLI login. The `publicPort` and `remotePort` features run entirely over this, so **the app authenticates them for you — no sign-in appears in the webview.**
+- **The hosted editor** (direct mode) is a github.com web app that needs a browser session cookie. That cookie can't be minted from an OAuth token, so the **editor asks you to sign in once** in the webview; it persists afterward.
+
+If you want to preview an app running inside a codespace with **zero webview login**, use `publicPort` (shareable) or `remotePort` (private) instead of the editor.
 
 ## How it works
 
@@ -30,11 +43,25 @@ only restricts framing — not top-level navigation — so:
 Named codespaces open via `https://github.com/codespaces/<name>`, which handles
 auth and redirects to the correct editor host.
 
+**Port previews** don't need the editor's cookie at all:
+
+- `publicPort` runs `gh codespace ports visibility <port>:public`, then reads
+  the real `browseUrl` from `gh codespace ports --json` (never guessed) and
+  loads it. Public ports serve without any auth.
+- `remotePort` runs `gh codespace ports forward <local>:<remote>` to an
+  ephemeral loopback port and loads `http://127.0.0.1:<local>` — private to
+  your machine, no auth.
+
+Both rely only on the Codespaces port-forwarding service (no in-container
+`sshd` required). The app must already be **listening** on the port inside the
+codespace.
+
 ## Prerequisites
 
 - GitHub Copilot CLI / GitHub app with canvas-extension support.
 - The [`gh` CLI](https://cli.github.com/) installed and authenticated.
-- For the **picker's list feature**, the `gh` token needs the `codespace` scope:
+- For **listing codespaces** and the **auth-free port previews** (`publicPort` /
+  `remotePort`), the `gh` token needs the `codespace` scope:
 
   ```sh
   gh auth refresh -h github.com -s codespace
@@ -65,17 +92,24 @@ Or use the `install_extension` tool directly with that URL.
 Once installed, ask Copilot to open the canvas, e.g.:
 
 - "Open the codespaces canvas" → shows the picker.
-- "Open codespace `octocat-myrepo-abc123`" → opens that codespace directly.
+- "Open codespace `octocat-myrepo-abc123`" → opens that codespace editor directly.
+- "Preview port 3000 of my codespace publicly" → `publicPort` (auth-free, shareable).
+- "Forward port 3000 of my codespace privately" → `remotePort` (auth-free, local only).
 
 The canvas id is `codespace-canvas`. Open input:
 
 ```jsonc
 {
-  "codespaceName": "octocat-myrepo-abc123", // optional: open this codespace directly
-  "repo": "owner/repo",                     // optional: filter picker + target "New codespace"
-  "url": "https://..."                      // optional: load an explicit URL
+  "codespaceName": "octocat-myrepo-abc123", // open this codespace editor directly
+  "repo": "owner/repo",                     // filter picker + target "New codespace"
+  "url": "https://...",                     // load an explicit URL
+  "publicPort": 3000,                       // set port public + load its GitHub URL (auth-free, shareable)
+  "remotePort": 3000                        // forward port to 127.0.0.1 (auth-free, private)
 }
 ```
+
+`publicPort` and `remotePort` require `codespaceName` and an app already
+listening on that port inside the codespace.
 
 ## Development
 

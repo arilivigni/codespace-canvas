@@ -13,13 +13,18 @@
 // Named codespaces open via https://github.com/codespaces/<name>, which
 // handles auth and redirects to the correct editor host.
 
-import { createServer } from "node:http";
-import { execFile } from "node:child_process";
+import { createServer, get as httpGet } from "node:http";
+import { execFile, spawn } from "node:child_process";
+import net from "node:net";
 import { joinSession, createCanvas } from "@github/copilot-sdk/extension";
 
 const CANVAS_ID = "codespace-canvas";
 
-// Per-instance state: { server?, url, title, mode: "picker" | "direct", repo? }
+// Per-instance state. Shapes by mode:
+//   picker:  { server, url, title, mode, repo }
+//   direct:  { url, title, mode, repo }
+//   forward: { url, title, mode, repo, codespaceName, remotePort, localPort, forwardProc }
+//   public:  { url, title, mode, repo, codespaceName, remotePort, browseUrl }
 const instances = new Map();
 
 let sessionRef = null;
@@ -31,12 +36,25 @@ function log(message, options) {
 // gh helpers
 // ---------------------------------------------------------------------------
 
+// The Copilot app injects a GH_TOKEN whose scopes it controls (no `codespace`
+// scope). Codespace operations need that scope, which lives on the user's
+// `gh` keyring login instead. Strip the injected token/host env so the `gh`
+// CLI authenticates from its own stored credentials.
+function ghEnv() {
+    const env = { ...process.env };
+    delete env.GH_TOKEN;
+    delete env.GITHUB_TOKEN;
+    delete env.GH_HOST;
+    delete env.GH_ENTERPRISE_TOKEN;
+    return env;
+}
+
 function gh(args) {
     return new Promise((resolve) => {
         execFile(
             "gh",
             args,
-            { maxBuffer: 10 * 1024 * 1024, env: process.env },
+            { maxBuffer: 10 * 1024 * 1024, env: ghEnv() },
             (error, stdout, stderr) => {
                 resolve({
                     ok: !error,
@@ -85,6 +103,204 @@ function createUrlForRepo(repo) {
     return repo
         ? `https://github.com/codespaces/new?repo=${encodeURIComponent(repo)}`
         : "https://github.com/codespaces/new";
+}
+
+// ---------------------------------------------------------------------------
+// Auth-free app preview
+//
+// Reuses the app's `gh` login (needs the one-time `codespace` scope:
+// `gh auth refresh -h github.com -s codespace`) to surface an app running
+// inside a codespace, with NO github.com login in the webview. Two flavours:
+//   • remotePort → forward the port to loopback and load http://127.0.0.1:…
+//                  Stays PRIVATE to this machine. Needs a long-lived `gh`
+//                  forward process.
+//   • publicPort → set the codespace port's visibility to `public`, then load
+//                  its real GitHub browse URL (read from `gh`, never guessed).
+//                  Shareable and process-free, but PUBLIC to anyone with the
+//                  URL.
+// The editor itself is opened via the browser (direct mode) — GitHub's hosted
+// editor always requires a one-time github.com sign-in that then persists.
+// ---------------------------------------------------------------------------
+
+function getFreePort() {
+    return new Promise((resolve, reject) => {
+        const srv = net.createServer();
+        srv.on("error", reject);
+        srv.listen(0, "127.0.0.1", () => {
+            const port = srv.address().port;
+            srv.close(() => resolve(port));
+        });
+    });
+}
+
+function probeHttp(port) {
+    return new Promise((resolve) => {
+        const req = httpGet(
+            { host: "127.0.0.1", port, path: "/", timeout: 1500 },
+            (res) => {
+                res.resume();
+                resolve(true);
+            },
+        );
+        req.on("timeout", () => {
+            req.destroy();
+            resolve(false);
+        });
+        req.on("error", () => resolve(false));
+    });
+}
+
+// Spawn a long-lived `gh codespace ports forward` process. Returns the child.
+function startForward(codespaceName, remotePort, localPort) {
+    return spawn(
+        "gh",
+        [
+            "codespace",
+            "ports",
+            "forward",
+            `${localPort}:${remotePort}`,
+            "-c",
+            codespaceName,
+        ],
+        { env: ghEnv(), stdio: "ignore" },
+    );
+}
+
+// PRIVATE, auth-free: forward a codespace port to loopback.
+async function openLocalForward(instanceId, codespaceName, remotePort, repo) {
+    if (!Number.isInteger(remotePort)) {
+        throw new Error("remotePort must be an integer");
+    }
+    await cleanupTunnel(instanceId);
+
+    const localPort = await getFreePort();
+    log(
+        `Forwarding ${codespaceName}:${remotePort} → 127.0.0.1:${localPort}…`,
+        { ephemeral: true },
+    );
+    const forwardProc = startForward(codespaceName, remotePort, localPort);
+
+    let forwardExited = false;
+    forwardProc.on("exit", () => {
+        forwardExited = true;
+    });
+
+    const deadline = Date.now() + 20000;
+    let ready = false;
+    while (Date.now() < deadline) {
+        if (forwardExited) break;
+        if (await probeHttp(localPort)) {
+            ready = true;
+            break;
+        }
+        await new Promise((r) => setTimeout(r, 750));
+    }
+
+    if (!ready) {
+        try {
+            forwardProc.kill();
+        } catch {}
+        if (forwardExited) {
+            throw new Error(
+                "`gh codespace ports forward` exited immediately. Make sure the token gh uses has the `codespace` scope (`gh auth refresh -h github.com -s codespace`) and that the codespace is running.",
+            );
+        }
+        throw new Error(
+            `Timed out forwarding port ${remotePort}. Is an app listening on that port in the codespace?`,
+        );
+    }
+
+    const url = `http://127.0.0.1:${localPort}/`;
+    const title = `${codespaceName} :${remotePort} (private)`;
+    instances.set(instanceId, {
+        url,
+        title,
+        mode: "forward",
+        repo: repo || "",
+        codespaceName,
+        remotePort,
+        localPort,
+        forwardProc,
+    });
+    return { url, title, status: `Port ${remotePort} · private forward` };
+}
+
+// Read a forwarded port's real browse URL from gh (never guess the format).
+async function browseUrlFor(codespaceName, port) {
+    const res = await gh([
+        "codespace",
+        "ports",
+        "-c",
+        codespaceName,
+        "--json",
+        "sourcePort,browseUrl,visibility",
+    ]);
+    if (!res.ok) return null;
+    try {
+        const ports = JSON.parse(res.stdout || "[]");
+        const match = ports.find((p) => Number(p.sourcePort) === Number(port));
+        return match || null;
+    } catch {
+        return null;
+    }
+}
+
+// PUBLIC, auth-free: mark a codespace port public and load its GitHub URL.
+async function openPublicPort(instanceId, codespaceName, publicPort, repo) {
+    if (!Number.isInteger(publicPort)) {
+        throw new Error("publicPort must be an integer");
+    }
+    await cleanupTunnel(instanceId);
+
+    log(`Making ${codespaceName}:${publicPort} public…`, { ephemeral: true });
+    const vis = await gh([
+        "codespace",
+        "ports",
+        "visibility",
+        `${publicPort}:public`,
+        "-c",
+        codespaceName,
+    ]);
+    if (!vis.ok) {
+        const notForwarded = /not forwarded|no port|not found/i.test(vis.stderr);
+        throw new Error(
+            notForwarded
+                ? `Port ${publicPort} isn't forwarded yet. Start the app in the codespace (so the port is detected), then retry. gh said: ${vis.stderr.trim()}`
+                : `Could not make port ${publicPort} public. Your org may forbid public ports. gh said: ${vis.stderr.trim()}`,
+        );
+    }
+
+    const info = await browseUrlFor(codespaceName, publicPort);
+    const url = info?.browseUrl;
+    if (!url) {
+        throw new Error(
+            `Port ${publicPort} was set public but gh returned no browse URL for it yet. Retry in a moment.`,
+        );
+    }
+
+    const title = `${codespaceName} :${publicPort} (public)`;
+    instances.set(instanceId, {
+        url,
+        title,
+        mode: "public",
+        repo: repo || "",
+        codespaceName,
+        remotePort: publicPort,
+        browseUrl: url,
+    });
+    return { url, title, status: `Port ${publicPort} · PUBLIC` };
+}
+
+async function cleanupTunnel(instanceId) {
+    const state = instances.get(instanceId);
+    if (!state) return;
+    const proc = state.forwardProc;
+    if (proc && !proc.killed) {
+        try {
+            proc.kill();
+        } catch {}
+    }
+    state.forwardProc = undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -262,14 +478,14 @@ const session = await joinSession({
             id: CANVAS_ID,
             displayName: "GitHub Codespace",
             description:
-                "Open a GitHub Codespace in a side panel. Pass a codespace name or repo to open directly, or omit input to show a picker of your codespaces.",
+                "Open a GitHub Codespace in a side panel. Show a picker, open a codespace's hosted editor (browser), or preview an app running inside a codespace auth-free via the app's gh login: publicPort sets a port public and loads its GitHub URL (shareable), or remotePort forwards a port to loopback (private to this machine).",
             inputSchema: {
                 type: "object",
                 properties: {
                     codespaceName: {
                         type: "string",
                         description:
-                            "Exact codespace name (e.g. 'octocat-myrepo-abc123'). Opens that codespace directly.",
+                            "Exact codespace name (e.g. 'octocat-myrepo-abc123'). Opens that codespace's editor directly (browser; one-time github.com sign-in).",
                     },
                     repo: {
                         type: "string",
@@ -280,6 +496,16 @@ const session = await joinSession({
                         type: "string",
                         description:
                             "Explicit URL to load (advanced escape hatch, e.g. a forwarded port URL).",
+                    },
+                    publicPort: {
+                        type: "integer",
+                        description:
+                            "Requires codespaceName. Set this codespace port's visibility to public and load its real GitHub browse URL — auth-free and shareable. WARNING: anyone with the URL can reach it. The app must already be listening on the port.",
+                    },
+                    remotePort: {
+                        type: "integer",
+                        description:
+                            "Requires codespaceName. Forward this codespace port to loopback and load http://127.0.0.1 — auth-free and PRIVATE to this machine. The app must already be listening on the port.",
                     },
                 },
             },
@@ -315,7 +541,62 @@ const session = await joinSession({
                             url: state.url,
                             title: state.title,
                             repo: state.repo ?? null,
+                            codespaceName: state.codespaceName ?? null,
+                            localPort: state.localPort ?? null,
+                            remotePort: state.remotePort ?? null,
+                            browseUrl: state.browseUrl ?? null,
                         };
+                    },
+                },
+                {
+                    name: "make_port_private",
+                    description:
+                        "Revert a codespace port's visibility back to private. Use to undo a publicPort exposure.",
+                    inputSchema: {
+                        type: "object",
+                        properties: {
+                            codespaceName: {
+                                type: "string",
+                                description: "Codespace name. Defaults to the one this canvas is showing.",
+                            },
+                            port: {
+                                type: "integer",
+                                description: "Port to set private. Defaults to this canvas's current port.",
+                            },
+                        },
+                    },
+                    handler: async (ctx) => {
+                        const state = instances.get(ctx.instanceId);
+                        const codespaceName =
+                            ctx.input?.codespaceName || state?.codespaceName;
+                        const port = ctx.input?.port ?? state?.remotePort;
+                        if (!codespaceName || port == null) {
+                            return { ok: false, error: "codespaceName and port are required" };
+                        }
+                        const res = await gh([
+                            "codespace",
+                            "ports",
+                            "visibility",
+                            `${port}:private`,
+                            "-c",
+                            codespaceName,
+                        ]);
+                        return res.ok
+                            ? { ok: true, codespaceName, port, visibility: "private" }
+                            : { ok: false, error: res.stderr.trim() };
+                    },
+                },
+                {
+                    name: "stop_forward",
+                    description:
+                        "Stop the private port-forward for this canvas instance (kills the gh forward process). No-op if not forwarding.",
+                    handler: async (ctx) => {
+                        const state = instances.get(ctx.instanceId);
+                        if (!state || state.mode !== "forward") {
+                            return { stopped: false, reason: "not forwarding" };
+                        }
+                        await cleanupTunnel(ctx.instanceId);
+                        return { stopped: true, codespaceName: state.codespaceName };
                     },
                 },
             ],
@@ -325,14 +606,38 @@ const session = await joinSession({
                     typeof input.codespaceName === "string" ? input.codespaceName.trim() : "";
                 const repo = typeof input.repo === "string" ? input.repo.trim() : "";
                 const explicitUrl = typeof input.url === "string" ? input.url.trim() : "";
+                const hasPublicPort =
+                    input.publicPort != null && input.publicPort !== "";
+                const hasRemotePort =
+                    input.remotePort != null && input.remotePort !== "";
 
                 const existing = instances.get(ctx.instanceId);
 
-                // Direct URL (explicit or named codespace) — no local server needed.
+                // Auth-free app preview (via the app's gh login).
+                if (codespaceName && (hasPublicPort || hasRemotePort)) {
+                    if (existing?.server) await closeServer(ctx.instanceId);
+                    if (hasPublicPort) {
+                        return await openPublicPort(
+                            ctx.instanceId,
+                            codespaceName,
+                            Number(input.publicPort),
+                            repo,
+                        );
+                    }
+                    return await openLocalForward(
+                        ctx.instanceId,
+                        codespaceName,
+                        Number(input.remotePort),
+                        repo,
+                    );
+                }
+
+                // Direct URL (explicit or named codespace editor) — browser mode.
                 if (explicitUrl || codespaceName) {
                     const url = explicitUrl || editorUrlForName(codespaceName);
                     const title = codespaceName || "Codespace";
                     if (existing?.server) await closeServer(ctx.instanceId);
+                    await cleanupTunnel(ctx.instanceId);
                     instances.set(ctx.instanceId, { url, title, mode: "direct", repo });
                     log(`Opening codespace canvas → ${title}`, { ephemeral: true });
                     return {
@@ -354,6 +659,7 @@ const session = await joinSession({
             },
             onClose: async (ctx) => {
                 await closeServer(ctx.instanceId);
+                await cleanupTunnel(ctx.instanceId);
                 instances.delete(ctx.instanceId);
             },
         }),
