@@ -22,9 +22,10 @@ Open a picker of all your codespaces, or jump straight into a specific one — w
 
 ## Running commands / starting the app (`sshd` feature)
 
-`startCommand` and `exec_in_codespace` run commands via `gh codespace ssh`, which
-needs an **SSH server in the container**. Add the feature to your repo's
-`.devcontainer/devcontainer.json` and rebuild (or create) the codespace:
+`startCommand`, `editorServe`, and `exec_in_codespace` run commands via
+`gh codespace ssh`, which needs an **SSH server in the container**. Add the
+feature to your repo's `.devcontainer/devcontainer.json` and rebuild (or create)
+the codespace:
 
 ```jsonc
 "features": {
@@ -36,6 +37,11 @@ With that in place, the whole preview flow is **fully auth-free** — the extens
 starts your app and exposes the port using only the app's `gh` login, and you
 never open the web editor or hit a 2FA prompt. Without `sshd`, use `publicPort`/
 `remotePort` on a port you started yourself (e.g. from the editor terminal).
+
+> **Heads up on existing codespaces:** a codespace created *before* you added
+> `sshd` won't pick it up from a **rebuild** — the rebuild reads the
+> devcontainer config already inside the container, not the latest branch.
+> **Create a fresh codespace** on the updated branch instead.
 
 ## Auth model
 
@@ -119,16 +125,41 @@ Or use the `install_extension` tool directly with that URL.
 Once installed, ask Copilot to open the canvas, e.g.:
 
 - "Open the codespaces canvas" → shows the picker.
-- "Open codespace `octocat-myrepo-abc123`" → opens that codespace editor directly.
+- "Open codespace `octocat-myrepo-abc123` sign-in free" → `editorServe` (full editor, no github.com sign-in; needs `sshd`).
+- "Open codespace `octocat-myrepo-abc123`" → opens that codespace's hosted editor directly (one-time github.com sign-in).
 - "Preview port 3000 of my codespace publicly" → `publicPort` (auth-free, shareable).
 - "Forward port 3000 of my codespace privately" → `remotePort` (auth-free, local only).
 - "Run my dev server and preview it" → `startCommand` + `publicPort`/`remotePort` (auth-free, no editor; needs `sshd`).
+- "Refresh the codespace canvas" → `refresh` action (re-open the canvas to reload the panel).
+
+### Attaching to an existing codespace
+
+All modes below target a codespace you already have by `codespaceName`. Pick
+one based on what you want:
+
+| You want… | Open input | Auth in the panel | Needs `sshd`? |
+|---|---|---|---|
+| **Full editor, no sign-in** | `{ codespaceName, editorServe: true }` | connection token in the URL | ✅ yes |
+| Real hosted editor | `{ codespaceName }` | one-time github.com sign-in | no |
+| Preview a running app (shareable) | `{ codespaceName, publicPort: 3000 }` | app's `gh` login | no\* |
+| Preview a running app (private) | `{ codespaceName, remotePort: 3000 }` | app's `gh` login | no\* |
+| Start the app, then preview | `+ startCommand: "npm run dev"` | app's `gh` login | ✅ yes |
+| Just browse / pick | *(no input)* → picker | — | no |
+
+\* The `publicPort` / `remotePort` previews need the app **already listening** on
+that port; `startCommand` and `editorServe` start things for you and so need `sshd`.
+
+**How `editorServe` attaches, under the hood:** finds the codespace by name →
+runs `code serve-web` inside it over `gh codespace ssh` (auth is a per-open
+connection token in the URL, *not* a github.com cookie) → seeds a dark theme →
+forwards and exposes the port → loads `https://<name>-8200.app.github.dev/?tkn=…`.
 
 The canvas id is `codespace-canvas`. Open input:
 
 ```jsonc
 {
-  "codespaceName": "octocat-myrepo-abc123", // open this codespace editor directly
+  "codespaceName": "octocat-myrepo-abc123", // target an existing codespace by name
+  "editorServe": true,                      // full VS Code editor, NO github.com sign-in (needs sshd)
   "repo": "owner/repo",                     // filter picker + target "New codespace"
   "url": "https://...",                     // load an explicit URL
   "publicPort": 3000,                       // expose port publicly + load its GitHub URL (auth-free, shareable)
@@ -137,8 +168,9 @@ The canvas id is `codespace-canvas`. Open input:
 }
 ```
 
-`publicPort` and `remotePort` require `codespaceName` and an app listening on
-that port — either started by you or by `startCommand`.
+`editorServe`, `publicPort`, and `remotePort` all require `codespaceName`.
+`publicPort` / `remotePort` also need an app listening on that port — either
+started by you or by `startCommand`.
 
 ## Development
 
