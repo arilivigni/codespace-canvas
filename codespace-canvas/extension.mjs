@@ -439,17 +439,32 @@ async function openEditorServe(instanceId, codespaceName, repo) {
     }
 
     const localPort = await getFreePort();
-    const forwardProc = startForward(codespaceName, CS_EDITOR_PORT, localPort);
-    let forwardExited = false;
-    forwardProc.on("exit", () => {
-        forwardExited = true;
-    });
+
+    // On a brand-new codespace, serve-web downloads the VS Code CLI (~15-20s)
+    // before it binds, and the forward can drop during that window. So keep a
+    // live forward supervised: if it exits before the port is ready, respawn
+    // it. Track the current child so we can hand the survivor to the instance.
+    let forwardProc = startForward(codespaceName, CS_EDITOR_PORT, localPort);
+    let forwardAlive = true;
+    let restarts = 0;
+    const onExit = () => {
+        forwardAlive = false;
+    };
+    forwardProc.on("exit", onExit);
 
     // serve-web downloads assets on first hit — allow generous readiness time.
-    const deadline = Date.now() + 90000;
+    const deadline = Date.now() + 120000;
     let ready = false;
     while (Date.now() < deadline) {
-        if (forwardExited) break;
+        if (!forwardAlive) {
+            if (restarts >= 8) break;
+            restarts++;
+            forwardProc = startForward(codespaceName, CS_EDITOR_PORT, localPort);
+            forwardAlive = true;
+            forwardProc.on("exit", onExit);
+            await new Promise((r) => setTimeout(r, 1500));
+            continue;
+        }
         if (await probeHttp(localPort)) {
             ready = true;
             break;
@@ -461,8 +476,8 @@ async function openEditorServe(instanceId, codespaceName, repo) {
             forwardProc.kill();
         } catch {}
         throw new Error(
-            forwardExited
-                ? "`gh codespace ports forward` exited immediately. Ensure gh has the `codespace` scope and the codespace is running."
+            restarts >= 8
+                ? "`gh codespace ports forward` keeps exiting. Ensure gh has the `codespace` scope and the codespace is running."
                 : "Timed out waiting for the editor server to come up. Check /tmp/codespace-canvas.log in the codespace.",
         );
     }
