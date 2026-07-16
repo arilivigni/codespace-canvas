@@ -395,11 +395,17 @@ async function openPublicPort(instanceId, codespaceName, publicPort, repo) {
 // downloads its web assets on first connection, so the first load can take a
 // little longer.
 function serveWebScript(port, token) {
+    // Default the served editor to a dark theme by seeding User settings the
+    // first time only (so a user's later theme change is preserved).
+    const settingsPath = "/tmp/serve-web-data/data/User/settings.json";
     return [
         "mkdir -p /tmp/vscode-cli && cd /tmp/vscode-cli",
         "if [ ! -x ./code ]; then " +
             'curl -sLk "https://code.visualstudio.com/sha/download?build=stable&os=cli-alpine-x64" -o cli.tgz && ' +
             "tar -xzf cli.tgz; fi",
+        `mkdir -p "$(dirname ${settingsPath})"`,
+        `if [ ! -f ${settingsPath} ]; then ` +
+            `printf '%s' '{ "workbench.colorTheme": "Default Dark Modern" }' > ${settingsPath}; fi`,
         `exec ./code serve-web --port ${port} --host 127.0.0.1 ` +
             `--connection-token ${token} --accept-server-license-terms ` +
             "--server-data-dir /tmp/serve-web-data",
@@ -409,7 +415,31 @@ function serveWebScript(port, token) {
 // Sign-in-free editor: run `code serve-web` inside the codespace (auth = a
 // connection token, no github.com login), then expose its port publicly and
 // load the tokenized URL. Requires the devcontainer `sshd` feature.
-async function openEditorServe(instanceId, codespaceName, repo) {
+//
+// Idempotent: if this instance already has a healthy editor (serve-web up and
+// its forward answering), reuse the same token/URL. Re-opening the canvas then
+// acts as a lightweight reload instead of tearing serve-web down. Pass
+// force:true to restart serve-web with a fresh token.
+async function openEditorServe(instanceId, codespaceName, repo, { force = false } = {}) {
+    const prior = instances.get(instanceId);
+    if (
+        !force &&
+        prior?.mode === "editor" &&
+        prior.codespaceName === codespaceName &&
+        prior.url &&
+        prior.localPort &&
+        prior.forwardProc &&
+        !prior.forwardProc.killed &&
+        (await probeHttp(prior.localPort))
+    ) {
+        log("Reusing the running editor…", { ephemeral: true });
+        return {
+            url: prior.url,
+            title: prior.title,
+            status: "Editor (sign-in free)",
+        };
+    }
+
     await cleanupTunnel(instanceId);
 
     const token = randomUUID().replace(/-/g, "");
@@ -526,6 +556,7 @@ async function openEditorServe(instanceId, codespaceName, repo) {
         localPort,
         browseUrl: info.browseUrl,
         forwardProc,
+        token,
     });
     return { url, title, status: "Editor (sign-in free)" };
 }
@@ -717,7 +748,7 @@ const session = await joinSession({
             id: CANVAS_ID,
             displayName: "GitHub Codespace",
             description:
-                "Open a GitHub Codespace in a side panel. Show a picker, open a codespace's hosted editor (browser), or preview an app running inside a codespace auth-free via the app's gh login: publicPort sets a port public and loads its GitHub URL (shareable), or remotePort forwards a port to loopback (private to this machine). With startCommand (needs the devcontainer sshd feature) it can also start the app for you first — no editor sign-in. With editorServe (needs sshd) it opens a full VS Code editor with NO github.com sign-in via a token-authed code serve-web.",
+                "Open a GitHub Codespace in a side panel. Show a picker, open a codespace's hosted editor (browser), or preview an app running inside a codespace auth-free via the app's gh login: publicPort sets a port public and loads its GitHub URL (shareable), or remotePort forwards a port to loopback (private to this machine). With startCommand (needs the devcontainer sshd feature) it can also start the app for you first — no editor sign-in. With editorServe (needs sshd) it opens a full VS Code editor (dark theme by default) with NO github.com sign-in via a token-authed code serve-web. Use the `refresh` action (then re-open the canvas) to reload the panel.",
             inputSchema: {
                 type: "object",
                 properties: {
@@ -882,6 +913,38 @@ const session = await joinSession({
                         return res.ok
                             ? { ok: true, codespaceName, port, visibility: "private" }
                             : { ok: false, error: res.stderr.trim() };
+                    },
+                },
+                {
+                    name: "refresh",
+                    description:
+                        "Refresh this canvas. Returns the URL to reload; the agent should re-open the canvas (same instanceId) to reload the panel. For the sign-in-free editor it repairs serve-web / the port forward if they died; pass hard:true to fully restart serve-web with a fresh connection token.",
+                    inputSchema: {
+                        type: "object",
+                        properties: {
+                            hard: {
+                                type: "boolean",
+                                description:
+                                    "Editor mode only: restart `code serve-web` with a fresh token instead of reusing the running one. Default false.",
+                            },
+                        },
+                    },
+                    handler: async (ctx) => {
+                        const state = instances.get(ctx.instanceId);
+                        if (!state) {
+                            return { ok: false, error: "Nothing is open in this canvas yet." };
+                        }
+                        if (state.mode === "editor") {
+                            const info = await openEditorServe(
+                                ctx.instanceId,
+                                state.codespaceName,
+                                state.repo,
+                                { force: ctx.input?.hard === true },
+                            );
+                            return { ok: true, reopen: true, url: info.url, mode: "editor" };
+                        }
+                        // Other modes just reload the same URL.
+                        return { ok: true, reopen: true, url: state.url, mode: state.mode };
                     },
                 },
                 {

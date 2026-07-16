@@ -8,7 +8,7 @@ Open a picker of all your codespaces, or jump straight into a specific one — w
 
 - **Picker mode** — lists your codespaces (name, repository, branch, state, last used) with an **Open** button for each, plus **New codespace** and **Refresh**.
 - **Direct mode** — open a specific codespace editor by name (one-time github.com sign-in in the webview, then it persists), or load an explicit URL.
-- **Sign-in-free editor (`editorServe`)** — set `editorServe: true` to get a **full VS Code editor with no github.com sign-in at all**. The extension runs `code serve-web` inside the codespace (authenticated by a per-open connection token in the URL, not a github.com cookie), exposes its port, and loads the tokenized URL. Requires the devcontainer `sshd` feature (see below).
+- **Sign-in-free editor (`editorServe`)** — set `editorServe: true` to get a **full VS Code editor with no github.com sign-in at all**. The extension runs `code serve-web` inside the codespace (authenticated by a per-open connection token in the URL, not a github.com cookie), exposes its port, and loads the tokenized URL. Opens in a **dark theme by default** (seeded once; your later theme change sticks). Requires the devcontainer `sshd` feature (see below).
 - **Public port (auth-free)** — set `publicPort` to expose a codespace port with **public** visibility and load its real GitHub browse URL. Shareable and requires no sign-in. ⚠️ Anyone with the URL can reach it.
 - **Private forward (auth-free)** — set `remotePort` to forward a codespace port to loopback (`127.0.0.1`) over the app's `gh` login. No sign-in, private to your machine.
 - **Start the app for you (`startCommand`)** — combined with `publicPort`/`remotePort`, runs a command inside the codespace over `gh` to launch the app first, then previews it. **No web editor at all** — requires the devcontainer `sshd` feature (see below).
@@ -17,6 +17,7 @@ Open a picker of all your codespaces, or jump straight into a specific one — w
   - `get_current` — reports what the panel is currently showing (mode, url, ports, browseUrl).
   - `exec_in_codespace` — run any shell command inside a codespace over `gh` (auth-free); `background: true` to start a long-running server. Requires the `sshd` feature.
   - `make_port_private` — revert a `publicPort` exposure back to private.
+  - `refresh` — reload the canvas; for the sign-in-free editor it repairs `serve-web` / the port forward if they died, or `hard: true` restarts `serve-web` with a fresh token. Re-open the canvas afterward to reload the panel.
   - `stop_forward` — stop a private `remotePort` forward for the instance.
 
 ## Running commands / starting the app (`sshd` feature)
